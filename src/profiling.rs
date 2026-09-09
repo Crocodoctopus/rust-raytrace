@@ -142,7 +142,7 @@ impl PipelineProfiler {
         true
     }
 
-    pub(crate) fn print_report(profilers: &[Self]) {
+    pub(crate) fn print_report<'a>(profilers: impl IntoIterator<Item = &'a Self>) {
         let mut entries: Vec<ProfileReportEntry> = Vec::new();
         for profiler in profilers {
             let mut state = profiler.state.borrow_mut();

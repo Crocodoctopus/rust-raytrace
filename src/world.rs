@@ -44,4 +44,24 @@ impl WorldDiff {
             removed_meshes: previous.meshes.difference(&next.meshes).copied().collect(),
         }
     }
+
+    // A FIF may only encode objects whose mesh payload is resident. Keep that
+    // decision next to the snapshot diff rather than teaching every consumer
+    // of World about missing GPU meshes.
+    pub(crate) fn between_resident(
+        previous: &World,
+        canonical: &World,
+        mesh_is_resident: impl Fn(MeshHandle) -> bool,
+    ) -> (Self, World) {
+        let target = World {
+            objects: canonical
+                .objects
+                .iter()
+                .filter(|(_, object)| mesh_is_resident(object.mesh))
+                .map(|(&handle, &object)| (handle, object))
+                .collect(),
+            meshes: canonical.meshes.iter().filter(|&&mesh| mesh_is_resident(mesh)).copied().collect(),
+        };
+        (Self::between(previous, &target), target)
+    }
 }

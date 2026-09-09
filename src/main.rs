@@ -11,6 +11,8 @@ extern crate vk_mem;
 extern crate winit;
 
 mod buffer;
+mod cache;
+mod cache2;
 mod core;
 mod glsl_types;
 mod image;

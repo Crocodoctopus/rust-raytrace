@@ -8,7 +8,7 @@ use crate::profiling::{PipelineProfiler, ProfileLabel};
 use crate::rw_queue::{ResourceQueue, WaitStrategy};
 use crate::staging::{StagingPool, StagingSpan, Whole};
 use crate::swapchain::Swapchain;
-use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallback};
+use crate::util::wait_semaphores_any_fallback;
 use crate::vk_helpers::*;
 use crate::world::{Object, World, WorldDiff};
 use ash::vk;
@@ -19,6 +19,7 @@ use std::mem::offset_of;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use threadpool::ThreadPool;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -549,51 +550,34 @@ impl SwapchainState {
     }
 }
 
-struct PendingSceneState {
-    // Keep the upload cmd buffer and staging allocation alive until promotion.
-    cmd: vk::CommandBuffer,
-    staging: StagingSpan,
-    scene_states: SceneState,
-}
+struct Fif {
+    profiler: PipelineProfiler,
 
-/* Resources that need regeneration when object set changes */
-struct SceneState {
-    // Scene-wide semi-stable buffers.
-    scene_index_buffer: Buffer<[GpuIndex]>,
-    scene_object_instance_buffer: Buffer<[GpuObjectInstance]>,
+    _descriptor_pool: vk::DescriptorPool,
+    _overdraw_descriptor_pool: vk::DescriptorPool,
+    cmd_buffers: [vk::CommandBuffer; PipelineStage::COUNT],
+    staging_buffer: StagingSpan,
+    frame_set: vk::DescriptorSet,
+    overdraw_set: vk::DescriptorSet,
+    frame_global_buffer: Buffer<GpuFrameGlobal>,
 
-    // FIF local buffers.
-    object_instance_buffer: [Buffer<[GpuObjectInstance]>; MAX_FRAMES_IN_FLIGHT],
-    indirect_cmd_buffers: [Buffer<GpuDrawCommandBuffer>; MAX_FRAMES_IN_FLIGHT],
-    frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
-    visibility_buffers: HashMap<ObjectHandle, ResourceQueue<Buffer<[u32]>>>,
+    // The next submission's base is also the completion value of the current
+    // submission because stage timeline values are contiguous.
+    base: u64,
+    timeline: vk::Semaphore,
 
-    // Bookkeeping
+    // This FIF's snapshot and persistent mesh layout. Objects are uploaded afresh each frame.
     world: World,
     scene_index_offsets: HashMap<MeshHandle, u32>,
-}
+    scene_index_buffer: Buffer<[GpuIndex]>,
+    object_instance_buffer: Buffer<[GpuObjectInstance]>,
+    indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
+    frustum_passing_meshlet_buffer: Buffer<GpuFrustumPassingMeshletBuffer>,
 
-impl SceneState {
-    unsafe fn free(self, core: &VulkanCore) {
-        let device = &core.device;
-        let allocator = &core.allocator;
-        for buffer in self.frustum_passing_meshlet_buffers {
-            buffer.destroy(&allocator);
-        }
-        self.scene_index_buffer.destroy(&allocator);
-        for (_, queue) in self.visibility_buffers {
-            for buffer in queue.free(device) {
-                buffer.destroy(&allocator);
-            }
-        }
-        self.scene_object_instance_buffer.destroy(&allocator);
-        for buffer in self.object_instance_buffer {
-            buffer.destroy(&allocator);
-        }
-        for buffer in self.indirect_cmd_buffers {
-            buffer.destroy(&allocator);
-        }
-    }
+    // Renderer owns the visibility columns; this FIF owns their selection for
+    // its current submission.
+    visibility_read: usize,
+    visibility_write: usize,
 }
 
 pub struct Renderer {
@@ -604,7 +588,6 @@ pub struct Renderer {
     swapchain: Swapchain,
 
     /* Profiling: */
-    profilers: [PipelineProfiler; MAX_FRAMES_IN_FLIGHT],
     profile_report_samples: u32,
 
     /* Pipelines: */
@@ -613,64 +596,41 @@ pub struct Renderer {
     /* Generic resource containers: */
     cwd: PathBuf,
     resource_counter: HandleCounter,
-    objects: BTreeMap<ObjectHandle, Object>,
+    // Canonical CPU scene. A FIF keeps its own resident, submitted snapshot.
+    world: World,
     meshes: BTreeMap<MeshHandle, Arc<Mesh>>,
 
     // Some cpu -> gpu resources.
     gpu_meshes: HashMap<MeshHandle, GpuMesh>,
     pending_gpu_meshes: HashMap<MeshHandle, PendingGpuMesh>,
 
-    // 
+    //
     thread_pool: ThreadPool,
     graphics_cmd_pools: Arc<SegQueue<vk::CommandPool>>,
 
     /* Staging: */
     staging: Arc<StagingPool>,
 
-    /* Scene: */
-    _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
-    _overdraw_descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
+    /* Frames in flight: */
+    fifs: [Fif; MAX_FRAMES_IN_FLIGHT],
 
-    // Submit command buffers.
-    cmd_buffers: [[vk::CommandBuffer; PipelineStage::COUNT]; MAX_FRAMES_IN_FLIGHT],
-
-    // Reusable FIF staging buffers.
-    staging_buffers: [StagingSpan; MAX_FRAMES_IN_FLIGHT],
-
-    // Global & per FIF desciptor sets.
+    // Global descriptor set.
     global_set: vk::DescriptorSet,
-    // (frame_sets and overdraw_sets are arrays of samplers)
-    frame_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
-    overdraw_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
 
-    // Global buffer.
-    frame_global_buffers: [Buffer<GpuFrameGlobal>; MAX_FRAMES_IN_FLIGHT],
-
-    // Used for sequencing stages, and other cross-frame syncing.
-    pipeline_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
-
-    // Serializes data upload across all FIF slots.
+    // Orders uploads across FIFs, including initialization of shared visibility.
     upload_sync_timeline: vk::Semaphore,
     upload_sync_counter: u64,
 
-    // Scene generation currently associated with each FIF slot.
-    fif_scene_generations: [u64; MAX_FRAMES_IN_FLIGHT],
-
-    // Next frame timeline wait value for each slot.
-    fif_timeline_waits: [u64; MAX_FRAMES_IN_FLIGHT],
-
     // Dirty flags for resource regeneration.
     swapchain_states_dirty: bool,
-    scene_states_dirty: bool,
 
     // Swapchain management.
     swapchain_states: SwapchainState,
 
-    // Scene management.
-    scene_generation_counter: u64,
-    scene_timeline: vk::Semaphore,
-    pending_scene_states: BTreeMap<u64, PendingSceneState>,
-    scene_states: BTreeMap<u64, SceneState>,
+    // Visibility is object-owned temporal state. FIFs reserve shared column
+    // indices from this queue for each submission.
+    visibility_buffers: HashMap<ObjectHandle, [Buffer<[u32]>; VISIBILITY_RESOURCE_QUEUE_LEN]>,
+    visibility_resource_queue: ResourceQueue<usize>,
 
     // Various render state data.
     frame: usize,
@@ -704,27 +664,10 @@ impl Renderer {
             // Build swapchain from core.
             let swapchain = Swapchain::new(&core, vk::Extent2D { width: viewport_w, height: viewport_h });
 
-            let profilers = std::array::from_fn(|_| PipelineProfiler::new(&core));
-
             let pipelines = Pipelines::new(&core);
-
-            // Per-frame recorded render buffers.
-            let cmd_buffers = std::array::from_fn(|_| {
-                device
-                    .allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(core.cmd_pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(PipelineStage::COUNT as _),
-                    )
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            });
 
             // Staging data.
             let staging = Arc::new(StagingPool::new(allocator, STAGING_ARENA_SIZE));
-            let staging_buffers = std::array::from_fn(|_| staging.alloc(STAGING_FIF_BLOCK_SIZE));
             let thread_pool =
                 ThreadPool::new(std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get()));
             let graphics_cmd_pools = Arc::new(SegQueue::new());
@@ -747,53 +690,6 @@ impl Renderer {
                 )
                 .unwrap();
 
-            // Generic descriptor pool.
-            let descriptor_pools = std::array::from_fn(|_| {
-                device
-                    .create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .pool_sizes(&[vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                                .descriptor_count(1)])
-                            .max_sets(1)
-                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                        None,
-                    )
-                    .unwrap()
-            });
-
-            let overdraw_descriptor_pools = std::array::from_fn(|_| {
-                device
-                    .create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .pool_sizes(&[
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                                    .descriptor_count(1),
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::STORAGE_IMAGE)
-                                    .descriptor_count(2),
-                            ])
-                            .max_sets(1)
-                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                        None,
-                    )
-                    .unwrap()
-            });
-
-            // Timeline semaphores for per-FIF stage sequencing.
-            let pipeline_semaphores = std::array::from_fn(|_| {
-                device
-                    .create_semaphore(
-                        &vk::SemaphoreCreateInfo::default().push_next(
-                            &mut vk::SemaphoreTypeCreateInfo::default()
-                                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                                .initial_value(0),
-                        ),
-                        None,
-                    )
-                    .unwrap()
-            });
             let upload_sync_timeline = device
                 .create_semaphore(
                     &vk::SemaphoreCreateInfo::default().push_next(
@@ -814,50 +710,63 @@ impl Renderer {
                 )
                 .unwrap()[0];
 
-            let frame_sets = std::array::from_fn(|fif| {
-                device
+            let fifs = std::array::from_fn(|_| {
+                let descriptor_pool = device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .pool_sizes(&[vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                                .descriptor_count(1)])
+                            .max_sets(1)
+                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                        None,
+                    )
+                    .unwrap();
+                let overdraw_descriptor_pool = device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .pool_sizes(&[
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                                    .descriptor_count(1),
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                                    .descriptor_count(2),
+                            ])
+                            .max_sets(1)
+                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                        None,
+                    )
+                    .unwrap();
+                let frame_set = device
                     .allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
-                            .descriptor_pool(descriptor_pools[fif])
+                            .descriptor_pool(descriptor_pool)
                             .set_layouts(&[pipelines.frame_set_layout]),
                     )
-                    .unwrap()[0]
-            });
-
-            let overdraw_sets = std::array::from_fn(|fif| {
-                device
+                    .unwrap()[0];
+                let overdraw_set = device
                     .allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
-                            .descriptor_pool(overdraw_descriptor_pools[fif])
+                            .descriptor_pool(overdraw_descriptor_pool)
                             .set_layouts(&[pipelines.overdraw_set_layout]),
                     )
-                    .unwrap()[0]
-            });
-
-            let frame_global_buffers = std::array::from_fn(|_| {
-                Buffer::<GpuFrameGlobal>::new(
+                    .unwrap()[0];
+                let frame_global_buffer = Buffer::<GpuFrameGlobal>::new(
                     &allocator,
                     vk::BufferUsageFlags::STORAGE_BUFFER
                         | vk::BufferUsageFlags::TRANSFER_DST
                         | vk::BufferUsageFlags::INDIRECT_BUFFER,
                     vk_mem::MemoryUsage::AutoPreferDevice,
-                )
-            });
-            let mut scene_timeline_type =
-                vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
-            let scene_timeline = device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut scene_timeline_type), None)
-                .unwrap();
-
-            for fif in 0..MAX_FRAMES_IN_FLIGHT {
+                );
                 let descriptor_buffer_infos = [vk::DescriptorBufferInfo::default()
-                    .buffer(frame_global_buffers[fif].vk_handle())
+                    .buffer(frame_global_buffer.vk_handle())
                     .offset(0)
                     .range(vk::WHOLE_SIZE)];
 
                 device.update_descriptor_sets(
                     &[vk::WriteDescriptorSet::default()
-                        .dst_set(frame_sets[fif])
+                        .dst_set(frame_set)
                         .dst_binding(0)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -868,7 +777,7 @@ impl Renderer {
 
                 device.update_descriptor_sets(
                     &[vk::WriteDescriptorSet::default()
-                        .dst_set(overdraw_sets[fif])
+                        .dst_set(overdraw_set)
                         .dst_binding(0)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -876,8 +785,51 @@ impl Renderer {
                         .buffer_info(&descriptor_buffer_infos)],
                     &[],
                 );
-            }
 
+                let cmd_buffers = device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(core.cmd_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(PipelineStage::COUNT as _),
+                    )
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let timeline = device
+                    .create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(
+                            &mut vk::SemaphoreTypeCreateInfo::default()
+                                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                                .initial_value(0),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+
+                Fif {
+                    profiler: PipelineProfiler::new(&core),
+                    _descriptor_pool: descriptor_pool,
+                    _overdraw_descriptor_pool: overdraw_descriptor_pool,
+                    cmd_buffers,
+                    staging_buffer: staging.alloc(STAGING_FIF_BLOCK_SIZE),
+                    frame_set,
+                    overdraw_set,
+                    frame_global_buffer,
+                    base: 0,
+                    timeline,
+                    world: World::default(),
+                    scene_index_offsets: HashMap::new(),
+                    scene_index_buffer: Buffer::null(),
+                    object_instance_buffer: Buffer::null(),
+                    indirect_cmd_buffer: Buffer::null(),
+                    frustum_passing_meshlet_buffer: Buffer::null(),
+                    visibility_read: 0,
+                    visibility_write: 0,
+                }
+            });
+
+            let overdraw_sets = std::array::from_fn(|fif| fifs[fif].overdraw_set);
             let swapchain_states = SwapchainState::new(&core, &swapchain, &pipelines, &overdraw_sets);
 
             //
@@ -886,14 +838,13 @@ impl Renderer {
 
                 swapchain,
 
-                profilers,
                 profile_report_samples: 0,
 
                 pipelines,
 
                 cwd: cwd.as_ref().to_owned(),
                 resource_counter: HandleCounter(0),
-                objects: BTreeMap::new(),
+                world: World::default(),
                 meshes: BTreeMap::new(),
 
                 gpu_meshes: HashMap::new(),
@@ -902,31 +853,13 @@ impl Renderer {
                 graphics_cmd_pools,
 
                 staging,
-
-                cmd_buffers,
-
-                staging_buffers,
-
-                _descriptor_pools: descriptor_pools,
-                _overdraw_descriptor_pools: overdraw_descriptor_pools,
-
+                fifs,
                 global_set,
-                frame_sets,
-                overdraw_sets,
-                frame_global_buffers,
-
-                pipeline_semaphores,
                 upload_sync_timeline,
                 upload_sync_counter: 0,
-                fif_scene_generations: [0; MAX_FRAMES_IN_FLIGHT],
-                fif_timeline_waits: [0; MAX_FRAMES_IN_FLIGHT],
                 swapchain_states_dirty: false,
-                scene_states_dirty: true,
-
-                scene_generation_counter: 0,
-                scene_timeline,
-                pending_scene_states: BTreeMap::new(),
-                scene_states: BTreeMap::new(),
+                visibility_buffers: HashMap::new(),
+                visibility_resource_queue: ResourceQueue::new(MAX_FRAMES_IN_FLIGHT, 0..VISIBILITY_RESOURCE_QUEUE_LEN),
                 swapchain_states,
 
                 frame: 0,
@@ -941,21 +874,19 @@ impl Renderer {
     fn rebuild_swapchain_states_if_dirty(&mut self) {
         if self.swapchain_states_dirty {
             self.swapchain_states_dirty = false;
+            let timelines = self.fifs.each_ref().map(|fif| fif.timeline);
+            let bases = self.fifs.each_ref().map(|fif| fif.base);
             unsafe {
                 self.core
                     .device
-                    .wait_semaphores(
-                        &vk::SemaphoreWaitInfo::default()
-                            .semaphores(&self.pipeline_semaphores)
-                            .values(&self.fif_timeline_waits),
-                        u64::MAX,
-                    )
+                    .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&timelines).values(&bases), u64::MAX)
                     .unwrap();
             }
 
             let mut swapchain = unsafe { Swapchain::new(&self.core, self.swapchain.extent) };
+            let overdraw_sets = self.fifs.each_ref().map(|fif| fif.overdraw_set);
             let mut swapchain_states =
-                unsafe { SwapchainState::new(&self.core, &swapchain, &self.pipelines, &self.overdraw_sets) };
+                unsafe { SwapchainState::new(&self.core, &swapchain, &self.pipelines, &overdraw_sets) };
             std::mem::swap(&mut self.swapchain_states, &mut swapchain_states);
             unsafe {
                 swapchain_states.free(&self.core);
@@ -972,7 +903,6 @@ impl Renderer {
             match unsafe { pending.try_unwrap(&self.core) } {
                 Ok(gpu_mesh) => {
                     self.gpu_meshes.insert(mesh_id, gpu_mesh);
-                    self.scene_states_dirty = true;
                 }
                 Err(pending) => {
                     self.pending_gpu_meshes.insert(mesh_id, pending);
@@ -981,13 +911,9 @@ impl Renderer {
         }
     }
 
-    fn rebuild_scene_if_dirty(&mut self) {
-        if !self.scene_states_dirty {
-            return;
-        }
-
+    fn upload_missing_gpu_meshes(&mut self) {
         let missing_meshes: Vec<_> =
-            self.meshes.keys().filter(|mesh_id| !self.gpu_meshes.contains_key(mesh_id)).copied().collect();
+            self.world.meshes.iter().filter(|mesh_id| !self.gpu_meshes.contains_key(mesh_id)).copied().collect();
         for mesh_id in missing_meshes {
             if self.pending_gpu_meshes.contains_key(&mesh_id) {
                 continue;
@@ -998,71 +924,31 @@ impl Renderer {
             };
             self.pending_gpu_meshes.insert(mesh_id, pending);
         }
-
-        if self.meshes.keys().any(|mesh_id| !self.gpu_meshes.contains_key(mesh_id)) {
-            return;
-        }
-
-        self.scene_states_dirty = false;
-        unsafe {
-            self.build_scene();
-        }
-    }
-
-    fn promote_completed_scene_states(&mut self) {
-        let ready_scene_states: Vec<_> = self
-            .pending_scene_states
-            .extract_if(.., |generation, _| unsafe {
-                self.core.device.get_semaphore_counter_value(self.scene_timeline).unwrap() >= *generation + 1
-            })
-            .collect();
-        for (generation, PendingSceneState { cmd, staging, scene_states }) in ready_scene_states {
-            unsafe {
-                self.core.device.free_command_buffers(self.core.cmd_pool, &[cmd]);
-            }
-            unsafe {
-                self.staging.free_span(staging);
-            }
-            self.scene_states.insert(generation, scene_states);
-        }
     }
 
     fn reserve_available_frame_slot(&mut self) -> (usize, u64) {
+        let timelines = self.fifs.each_ref().map(|fif| fif.timeline);
+        let bases = self.fifs.each_ref().map(|fif| fif.base);
         unsafe {
-            wait_semaphores_any_fallback(&self.core.device, &self.pipeline_semaphores, &self.fif_timeline_waits)
-                .unwrap();
+            wait_semaphores_any_fallback(&self.core.device, &timelines, &bases).unwrap();
         }
 
         let index = self
-            .pipeline_semaphores
+            .fifs
             .iter()
-            .zip(self.fif_timeline_waits.iter())
             .enumerate()
-            .find(|(_, (semaphore, wait))| unsafe {
-                self.core.device.get_semaphore_counter_value(**semaphore).unwrap() == **wait
-            })
+            .find(|(_, fif)| unsafe { self.core.device.get_semaphore_counter_value(fif.timeline).unwrap() == fif.base })
             .unwrap()
             .0;
 
-        let timeline = self.fif_timeline_waits[index];
-        self.fif_timeline_waits[index] += PipelineStage::COUNT as u64;
-        (index, timeline)
-    }
-
-    fn retire_scene_if_unreferenced(&mut self, generation: u64) {
-        if self.fif_scene_generations.contains(&generation) {
-            return;
-        }
-
-        if let Some(scene) = self.scene_states.remove(&generation) {
-            unsafe {
-                scene.free(&self.core);
-            }
-        }
+        let base = self.fifs[index].base;
+        self.fifs[index].base += PipelineStage::COUNT as u64;
+        (index, base)
     }
 
     unsafe fn read_and_accumulate_frame_profile(&mut self, frame_index: usize) {
-        let read_profile = self.profilers[frame_index]
+        let read_profile = self.fifs[frame_index]
+            .profiler
             .read_and_accumulate(&self.core.device, self.core.physical_device_properties.limits.timestamp_period);
         if !read_profile {
             return;
@@ -1070,7 +956,7 @@ impl Renderer {
 
         self.profile_report_samples += 1;
         if self.profile_report_samples == PipelineProfiler::REPORT_SAMPLES {
-            PipelineProfiler::print_report(&self.profilers);
+            PipelineProfiler::print_report(self.fifs.iter().map(|fif| &fif.profiler));
             self.profile_report_samples = 0;
         }
     }
@@ -1079,12 +965,25 @@ impl Renderer {
         &mut self,
         frame_index: usize,
         frame_timeline_base: u64,
-        scene_generation: u64,
         pipeline_semaphore: vk::Semaphore,
+        world: &World,
         object_dispatch: &mut Vec<(u16, u16)>,
     ) -> Vec<vk::SemaphoreSubmitInfo<'static>> {
-        let profiler = &self.profilers[frame_index];
-        let data_upload = self.cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
+        let Fif {
+            profiler,
+            cmd_buffers,
+            staging_buffer,
+            frame_global_buffer,
+            visibility_read,
+            visibility_write,
+            scene_index_offsets,
+            scene_index_buffer,
+            object_instance_buffer,
+            indirect_cmd_buffer,
+            frustum_passing_meshlet_buffer,
+            ..
+        } = &mut self.fifs[frame_index];
+        let data_upload = cmd_buffers[PipelineStage::DataUpload as usize];
         let upload_sync_wait_value = self.upload_sync_counter;
         self.upload_sync_counter += 1;
         let upload_sync_signal_value = self.upload_sync_counter;
@@ -1094,22 +993,11 @@ impl Renderer {
             value: PipelineStage::OcclusionCull.signal_value(frame_timeline_base),
         };
 
-        let SceneState {
-            indirect_cmd_buffers,
-            visibility_buffers,
-            scene_index_offsets,
-            scene_object_instance_buffer,
-            object_instance_buffer: object_instance_buffers,
-            frustum_passing_meshlet_buffers,
-            world,
-            ..
-        } = self.scene_states.get_mut(&scene_generation).unwrap();
-        let object_instance_buffer = &object_instance_buffers[frame_index];
-        let indirect_cmd_buffer = &indirect_cmd_buffers[frame_index];
-        let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[frame_index];
-        let frame_global_buffer = &self.frame_global_buffers[frame_index];
+        *visibility_read = *self.visibility_resource_queue.read(&self.core.device, visibility_wait_strategy);
+        let (column, visibility_resource_waits) =
+            self.visibility_resource_queue.write(&self.core.device, frame_index, visibility_wait_strategy).unwrap();
+        *visibility_write = *column;
 
-        let mut visibility_resource_waits = Vec::new();
         object_dispatch.reserve(world.objects.len());
         let camera_forward = Vec3::new(
             self.cam_rot[0].sin() * self.cam_rot[1].cos(),
@@ -1117,9 +1005,8 @@ impl Renderer {
             -self.cam_rot[0].cos() * self.cam_rot[1].cos(),
         );
         let mut object_data = Vec::with_capacity(world.objects.len());
-        for handle in world.objects.keys() {
-            let obj = self.objects.get(handle).unwrap();
-
+        let mut new_visibility_buffers = Vec::new();
+        for (handle, obj) in &world.objects {
             let mesh = self.meshes.get(&obj.mesh).unwrap();
             let gpu_mesh = self.gpu_meshes.get(&obj.mesh).unwrap();
             let scene_index_offset = *scene_index_offsets.get(&obj.mesh).unwrap();
@@ -1133,15 +1020,26 @@ impl Renderer {
 
             object_dispatch.push((object_data.len() as u16, meshlet_subrange.end - meshlet_subrange.start));
 
-            let (visibility_buffer, previous_visibility_buffer, waits) = {
-                let visibility_queue = visibility_buffers.get_mut(handle).unwrap();
-                let previous_visibility_buffer =
-                    visibility_queue.read(&self.core.device, visibility_wait_strategy).vk_handle();
-                let (visibility_buffer, waits) =
-                    visibility_queue.write(&self.core.device, frame_index, visibility_wait_strategy).unwrap();
-                (visibility_buffer.vk_handle(), previous_visibility_buffer, waits)
-            };
-            visibility_resource_waits.extend(waits);
+            // New objects have independent history allocations. Initialization is submitted
+            // through the shared upload timeline before any FIF can consume them.
+            let object_visibility_buffers = self.visibility_buffers.entry(*handle).or_insert_with(|| {
+                let len = mesh.lods.iter().map(|lod| lod.len() as u32).max().unwrap_or(0).max(1);
+                std::array::from_fn(|_| {
+                    let buffer = Buffer::<[u32]>::new(
+                        &self.core.allocator,
+                        len,
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                            | vk::BufferUsageFlags::TRANSFER_SRC
+                            | vk::BufferUsageFlags::TRANSFER_DST,
+                        vk_mem::MemoryUsage::AutoPreferDevice,
+                    );
+                    new_visibility_buffers.push((buffer.vk_handle(), buffer.size() as u64));
+                    buffer
+                })
+            });
+            let visibility_buffer = object_visibility_buffers[*visibility_write].vk_handle();
+            let previous_visibility_buffer = object_visibility_buffers[*visibility_read].vk_handle();
 
             object_data.push(GpuObjectInstance {
                 position: obj.position,
@@ -1216,29 +1114,56 @@ impl Renderer {
 
         record_cmd_buffer(&self.core.device, data_upload, |cmd| {
             profiler.begin(&self.core.device, cmd, PipelineStage::DataUpload, || {
-                // Upload scene data.
-                let staging = &mut self.staging_buffers[frame_index];
-                staging.reset();
-                self.staging.stage(staging, &self.core.device, cmd, &scene_object_instance_buffer, Whole(object_data));
-                self.core.device.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                        .buffer(scene_object_instance_buffer.vk_handle())
-                        .offset(0)
-                        .size(vk::WHOLE_SIZE)]),
-                );
-                self.core.device.cmd_copy_buffer(
-                    cmd,
-                    scene_object_instance_buffer.vk_handle(),
-                    object_instance_buffer.vk_handle(),
-                    &[vk::BufferCopy::default().size(scene_object_instance_buffer.size() as u64)],
-                );
+                // TODO: Record only the index copies selected by reconciliation's world diff.
+                // Until then, populate the complete target layout on every submission.
+                let barriers: Vec<_> = world
+                    .meshes
+                    .iter()
+                    .map(|mesh_id| {
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                            .buffer(self.gpu_meshes[mesh_id].index_buffer.vk_handle())
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)
+                    })
+                    .collect();
+                self.core
+                    .device
+                    .cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().buffer_memory_barriers(&barriers));
+                for mesh_id in &world.meshes {
+                    let source = &self.gpu_meshes[mesh_id].index_buffer;
+                    if source.size() == 0 {
+                        continue;
+                    }
+                    self.core.device.cmd_copy_buffer(
+                        cmd,
+                        source.vk_handle(),
+                        scene_index_buffer.vk_handle(),
+                        &[vk::BufferCopy::default()
+                            .dst_offset(scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<GpuIndex>() as u64)
+                            .size(source.size() as u64)],
+                    );
+                }
 
-                self.staging.stage(staging, &self.core.device, cmd, frame_global_buffer, Whole(frame_global));
+                for (buffer, size) in new_visibility_buffers {
+                    self.core.device.cmd_fill_buffer(cmd, buffer, 0, size, 0);
+                }
+
+                // CPU object records are rebuilt every frame and uploaded directly into this FIF.
+                staging_buffer.reset();
+                if !object_data.is_empty() {
+                    self.staging.stage(
+                        staging_buffer,
+                        &self.core.device,
+                        cmd,
+                        object_instance_buffer,
+                        Whole(object_data),
+                    );
+                }
+                self.staging.stage(staging_buffer, &self.core.device, cmd, frame_global_buffer, Whole(frame_global));
 
                 // Set indirect & frustum_passing lens to 0.
                 self.core.device.cmd_fill_buffer(
@@ -1299,9 +1224,10 @@ impl Renderer {
         object_dispatch: Vec<(u16, u16)>,
         visibility_resource_waits: Vec<vk::SemaphoreSubmitInfo<'static>>,
     ) {
-        let profiler = &self.profilers[frame_index];
-        let frustum_cull = self.cmd_buffers[frame_index][PipelineStage::FrustumCull as usize];
-        let frame_set = self.frame_sets[frame_index];
+        let fif = &self.fifs[frame_index];
+        let profiler = &fif.profiler;
+        let frustum_cull = fif.cmd_buffers[PipelineStage::FrustumCull as usize];
+        let frame_set = fif.frame_set;
 
         record_cmd_buffer(&self.core.device, frustum_cull, |cmd| {
             profiler.begin(&self.core.device, cmd, PipelineStage::FrustumCull, || {
@@ -1362,26 +1288,25 @@ impl Renderer {
         &self,
         frame_index: usize,
         frame_timeline_base: u64,
-        scene_generation: u64,
         image_index: u32,
         pipeline_semaphore: vk::Semaphore,
         image_acquired: vk::Semaphore,
         debug_draw_enabled: bool,
     ) {
-        let profiler = &self.profilers[frame_index];
-        let early_draw = self.cmd_buffers[frame_index][PipelineStage::EarlyDraw as usize];
+        let fif = &self.fifs[frame_index];
+        let profiler = &fif.profiler;
+        let early_draw = fif.cmd_buffers[PipelineStage::EarlyDraw as usize];
         let swapchain_extent = self.swapchain.extent;
         let swapchain_image = self.swapchain.images[image_index as usize];
         let swapchain_view = self.swapchain.views[image_index as usize];
         let depth_view = &self.swapchain_states.depth_views[frame_index];
         let overdraw_image = &self.swapchain_states.overdraw_images[frame_index];
         let global_set = self.global_set;
-        let frame_set = self.frame_sets[frame_index];
-        let overdraw_set = self.overdraw_sets[frame_index];
+        let frame_set = fif.frame_set;
+        let overdraw_set = fif.overdraw_set;
         let overshade_enabled = self.overshade_enabled;
-        let scene = self.scene_states.get(&scene_generation).unwrap();
-        let scene_index_buffer = &scene.scene_index_buffer;
-        let indirect_cmd_buffer = &scene.indirect_cmd_buffers[frame_index];
+        let scene_index_buffer = &fif.scene_index_buffer;
+        let indirect_cmd_buffer = &fif.indirect_cmd_buffer;
 
         if debug_draw_enabled {
             let swapchain_info = [vk::DescriptorImageInfo::default()
@@ -1581,8 +1506,9 @@ impl Renderer {
         frame_timeline_base: u64,
         pipeline_semaphore: vk::Semaphore,
     ) {
-        let profiler = &self.profilers[frame_index];
-        let build_hzb = self.cmd_buffers[frame_index][PipelineStage::BuildHzb as usize];
+        let fif = &self.fifs[frame_index];
+        let profiler = &fif.profiler;
+        let build_hzb = fif.cmd_buffers[PipelineStage::BuildHzb as usize];
         let swapchain_extent = self.swapchain.extent;
         let hzb_base_width = swapchain_extent.width.div_ceil(2).max(1);
         let hzb_base_height = swapchain_extent.height.div_ceil(2).max(1);
@@ -1743,16 +1669,15 @@ impl Renderer {
         &self,
         frame_index: usize,
         frame_timeline_base: u64,
-        scene_generation: u64,
         pipeline_semaphore: vk::Semaphore,
     ) {
-        let profiler = &self.profilers[frame_index];
-        let occlusion_cull = self.cmd_buffers[frame_index][PipelineStage::OcclusionCull as usize];
+        let fif = &self.fifs[frame_index];
+        let profiler = &fif.profiler;
+        let occlusion_cull = fif.cmd_buffers[PipelineStage::OcclusionCull as usize];
         let hzb_set = self.swapchain_states.hzb_sets[frame_index];
-        let frame_set = self.frame_sets[frame_index];
-        let frame_global_buffer = &self.frame_global_buffers[frame_index];
-        let scene = self.scene_states.get(&scene_generation).unwrap();
-        let indirect_cmd_buffer = &scene.indirect_cmd_buffers[frame_index];
+        let frame_set = fif.frame_set;
+        let frame_global_buffer = &fif.frame_global_buffer;
+        let indirect_cmd_buffer = &fif.indirect_cmd_buffer;
 
         record_cmd_buffer(&self.core.device, occlusion_cull, |cmd| {
             profiler.begin(&self.core.device, cmd, PipelineStage::OcclusionCull, || {
@@ -1811,23 +1736,22 @@ impl Renderer {
         &self,
         frame_index: usize,
         frame_timeline_base: u64,
-        scene_generation: u64,
         image_index: u32,
         pipeline_semaphore: vk::Semaphore,
         debug_draw_enabled: bool,
     ) {
-        let profiler = &self.profilers[frame_index];
-        let late_draw = self.cmd_buffers[frame_index][PipelineStage::LateDraw as usize];
+        let fif = &self.fifs[frame_index];
+        let profiler = &fif.profiler;
+        let late_draw = fif.cmd_buffers[PipelineStage::LateDraw as usize];
         let swapchain_extent = self.swapchain.extent;
         let swapchain_image = self.swapchain.images[image_index as usize];
         let swapchain_view = self.swapchain.views[image_index as usize];
         let depth_view = &self.swapchain_states.depth_views[frame_index];
         let global_set = self.global_set;
-        let frame_set = self.frame_sets[frame_index];
-        let overdraw_set = self.overdraw_sets[frame_index];
-        let scene = self.scene_states.get(&scene_generation).unwrap();
-        let scene_index_buffer = &scene.scene_index_buffer;
-        let indirect_cmd_buffer = &scene.indirect_cmd_buffers[frame_index];
+        let frame_set = fif.frame_set;
+        let overdraw_set = fif.overdraw_set;
+        let scene_index_buffer = &fif.scene_index_buffer;
+        let indirect_cmd_buffer = &fif.indirect_cmd_buffer;
 
         record_cmd_buffer(&self.core.device, late_draw, |cmd| {
             profiler.begin(&self.core.device, cmd, PipelineStage::LateDraw, || {
@@ -2017,7 +1941,7 @@ impl Renderer {
         render_finished: vk::Semaphore,
         debug_draw_enabled: bool,
     ) {
-        let frame_end = self.cmd_buffers[frame_index][PipelineStage::FrameEnd as usize];
+        let frame_end = self.fifs[frame_index].cmd_buffers[PipelineStage::FrameEnd as usize];
 
         record_cmd_buffer(&self.core.device, frame_end, |_cmd| {
             // FrameEnd is intentionally empty; it only preserves the stage accounting / timeline structure.
@@ -2054,9 +1978,9 @@ impl Renderer {
         &mut self,
         frame_index: usize,
         frame_timeline_base: u64,
-        scene_generation: u64,
+        world: World,
     ) -> (u32, vk::Semaphore) {
-        let pipeline_semaphore = self.pipeline_semaphores[frame_index];
+        let pipeline_semaphore = self.fifs[frame_index].timeline;
         let image_acquired = self.swapchain_states.image_acquired_semaphores[frame_index];
 
         let (image_index, _) = self
@@ -2078,10 +2002,14 @@ impl Renderer {
         let visibility_resource_waits = self.record_and_submit_data_upload_stage(
             frame_index,
             frame_timeline_base,
-            scene_generation,
             pipeline_semaphore,
+            &world,
             &mut object_dispatch,
         );
+
+        // Adopt the target snapshot only after its uploads have been submitted.
+        // The remaining stages consume those uploads through the FIF timeline.
+        self.fifs[frame_index].world = world;
 
         // FrustumCull stage. Records per-object compute dispatches and waits for upload plus visibility resources.
         self.record_and_submit_frustum_cull_stage(
@@ -2096,7 +2024,6 @@ impl Renderer {
         self.record_and_submit_early_draw_stage(
             frame_index,
             frame_timeline_base,
-            scene_generation,
             image_index,
             pipeline_semaphore,
             image_acquired,
@@ -2107,18 +2034,12 @@ impl Renderer {
         self.record_and_submit_build_hzb_stage(frame_index, frame_timeline_base, pipeline_semaphore);
 
         // OcclusionCull stage. Rebuilds the late indirect list from frustum candidates and the freshly built HZB.
-        self.record_and_submit_occlusion_cull_stage(
-            frame_index,
-            frame_timeline_base,
-            scene_generation,
-            pipeline_semaphore,
-        );
+        self.record_and_submit_occlusion_cull_stage(frame_index, frame_timeline_base, pipeline_semaphore);
 
         // LateDraw stage. Records newly visible draws and resolves/debug-transitions the swapchain image.
         self.record_and_submit_late_draw_stage(
             frame_index,
             frame_timeline_base,
-            scene_generation,
             image_index,
             pipeline_semaphore,
             debug_draw_enabled,
@@ -2139,32 +2060,17 @@ impl Renderer {
     pub fn render(&mut self, _timestamp: f32) {
         self.frame += 1;
 
-        // Promote completed asynchronous work before rebuilding dependent state.
+        // Mesh residency remains shared; each idle FIF reconciles its own scene.
         self.promote_completed_gpu_meshes();
-        self.promote_completed_scene_states();
-
-        // Lazy rebuild global state if neccessary.
+        self.upload_missing_gpu_meshes();
         self.rebuild_swapchain_states_if_dirty();
-        self.rebuild_scene_if_dirty();
 
-        // A scene may not be promoted yet to use, so return early.
-        if self.scene_states.is_empty() {
-            return;
-        }
-
-        // Grab a FIF slot that isn't doing anything.
         let (frame_index, frame_timeline_base) = self.reserve_available_frame_slot();
 
-        // Update this FIF slot's scene generation.
-        let scene_generation = *self.scene_states.last_key_value().unwrap().0;
-        let old_generation = std::mem::replace(&mut self.fif_scene_generations[frame_index], scene_generation);
-
-        // Only the scene generation that this FIF slot stopped referencing can become unreferenced.
-        self.retire_scene_if_unreferenced(old_generation);
-
         unsafe {
+            let world = self.reconcile_fif(frame_index);
             let (image_index, render_finished) =
-                self.record_and_submit_pipeline_stages(frame_index, frame_timeline_base, scene_generation);
+                self.record_and_submit_pipeline_stages(frame_index, frame_timeline_base, world);
 
             // Present.
             self.swapchain
@@ -2180,323 +2086,107 @@ impl Renderer {
         }
     }
 
-    unsafe fn build_scene(&mut self) {
-        let mut staging = self.staging.alloc(64 * MiB);
-        let cmd = self
-            .core
-            .device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.core.cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-            .unwrap()[0];
+    // Called only after this FIF's previous submission has completed.
+    unsafe fn reconcile_fif(&mut self, frame_index: usize) -> World {
+        let (_world_diff, world) = WorldDiff::between_resident(&self.fifs[frame_index].world, &self.world, |mesh_id| {
+            self.gpu_meshes.contains_key(&mesh_id)
+        });
 
-        let generation = self.scene_generation_counter;
-        self.scene_generation_counter = self.scene_generation_counter.wrapping_add(1);
-        let timeline_wait_value = generation;
-        let timeline_signal_value = generation + 1;
-
-        staging.reset();
-        self.core.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
-        self.core.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-
-        let new_world = World {
-            objects: self.objects.clone(),
-            meshes: self.meshes.keys().copied().collect(),
-        };
-
-        let previous_scene = self.scene_states.iter().next_back();
-        let previous_world = previous_scene.as_ref().map(|(_, scene)| &scene.world);
-        let world_diff = WorldDiff::between(previous_world.unwrap_or(&World::default()), &new_world);
-        // TODO: Use world_diff to choose between in-place master-buffer uploads and a new scene generation.
-        // For now build_scene remains the full-generation path.
-        let added_meshes: Vec<_> = world_diff.added_meshes.iter().copied().collect();
-        let removed_meshes: Vec<_> = world_diff.removed_meshes.iter().copied().collect();
-
-        let previous_scene = self.scene_states.iter_mut().next_back();
-        let mut previous_scene_visibility_buffers = previous_scene.map(|(_, scene)| &mut scene.visibility_buffers);
-
-        let mut scene_index_offsets = HashMap::with_capacity(new_world.meshes.len());
-        let mut scene_index_count = 0u32;
-        for mesh_id in &new_world.meshes {
-            let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
-            scene_index_offsets.insert(*mesh_id, scene_index_count);
-            scene_index_count += index_buffer.len();
-        }
-
-        let scene_index_buffer = Buffer::<[GpuIndex]>::new(
-            &self.core.allocator,
-            scene_index_count.max(1),
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let scene_index_buffer_barriers: Vec<_> = new_world
-            .meshes
-            .iter()
-            .map(|mesh_id| {
-                let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
-                vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .buffer(index_buffer.vk_handle())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE)
-            })
-            .collect();
-
-        self.core.device.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&scene_index_buffer_barriers),
-        );
-
-        for mesh_id in &new_world.meshes {
-            let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
-            let dst_offset = scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<GpuIndex>() as u64;
-            self.core.device.cmd_copy_buffer(
-                cmd,
-                index_buffer.vk_handle(),
-                scene_index_buffer.vk_handle(),
-                &[vk::BufferCopy::default().src_offset(0).dst_offset(dst_offset).size(index_buffer.size() as u64)],
-            );
-        }
-
-        let maximum_scene_meshlets = new_world
+        // Incremental uploads are still TODO, but this is the sole boundary at
+        // which a canonical object is rejected for lacking a resident mesh.
+        // Ensure capacity before planning updates from the local world to the target world.
+        let index_count =
+            world.meshes.iter().map(|mesh_id| self.gpu_meshes[mesh_id].index_buffer.len()).sum::<u32>().max(1);
+        let object_count = (world.objects.len() as u32).max(1);
+        let meshlet_count = world
             .objects
             .values()
-            .map(|object| {
-                let mesh = self.meshes.get(&object.mesh).unwrap();
-                mesh.lods.iter().map(|lod| lod.len() as u32).max().unwrap_or(0)
-            })
-            .sum::<u32>();
+            .map(|object| self.meshes[&object.mesh].lods.iter().map(|lod| lod.len() as u32).max().unwrap_or(0))
+            .sum::<u32>()
+            .max(1);
 
-        let mut new_visibility_buffers = HashMap::with_capacity(new_world.objects.len());
-        let mut visibility_buffer_bytes = 0usize;
-        for object_id in new_world.objects.keys() {
-            let object = self.objects.get(object_id).unwrap();
-            let mesh = self.meshes.get(&object.mesh).unwrap();
-            let maximum_mesh_meshlets = mesh.lods.iter().map(|lod| lod.len()).max().unwrap_or(0);
+        let fif = &mut self.fifs[frame_index];
+        let allocator = &self.core.allocator;
+        let storage_usage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
-            let visibility_buffers = (0..VISIBILITY_RESOURCE_QUEUE_LEN)
-                .map(|_| {
-                    Buffer::<[u32]>::new(
-                        &self.core.allocator,
-                        maximum_mesh_meshlets as u32,
-                        vk::BufferUsageFlags::STORAGE_BUFFER
-                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::TRANSFER_DST,
-                        vk_mem::MemoryUsage::AutoPreferDevice,
-                    )
-                })
-                .collect::<Vec<_>>();
-            visibility_buffer_bytes += visibility_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
-
-            let previous_visibility = previous_scene_visibility_buffers.as_mut().and_then(|buffers| {
-                (*buffers).get_mut(object_id).map(|queue| {
-                    let buffer = queue.read(
-                        &self.core.device,
-                        WaitStrategy { semaphore: self.scene_timeline, value: timeline_signal_value },
-                    );
-                    (buffer.vk_handle(), buffer.size())
-                })
-            });
-
-            match previous_visibility {
-                Some((previous_visibility, previous_visibility_size)) => {
-                    for visibility_buffer in &visibility_buffers {
-                        let copy_size = previous_visibility_size.min(visibility_buffer.size()) as u64;
-                        if copy_size < visibility_buffer.size() as u64 {
-                            self.core.device.cmd_fill_buffer(
-                                cmd,
-                                visibility_buffer.vk_handle(),
-                                copy_size,
-                                visibility_buffer.size() as u64 - copy_size,
-                                0,
-                            );
-                        }
-                        if copy_size > 0 {
-                            self.core.device.cmd_copy_buffer(
-                                cmd,
-                                previous_visibility,
-                                visibility_buffer.vk_handle(),
-                                &[vk::BufferCopy::default().size(copy_size)],
-                            );
-                        }
-                    }
-                }
-                None => {
-                    for visibility_buffer in &visibility_buffers {
-                        self.core.device.cmd_fill_buffer(
-                            cmd,
-                            visibility_buffer.vk_handle(),
-                            0,
-                            visibility_buffer.size() as u64,
-                            0,
-                        );
-                    }
-                }
-            }
-
-            new_visibility_buffers.insert(*object_id, ResourceQueue::new(MAX_FRAMES_IN_FLIGHT, visibility_buffers));
+        // Only the idle FIF's undersized buffers are replaced. Invalidate its snapshot
+        // so persistent contents are repopulated before the next draw.
+        // Count replacement buffer bytes and time allocation only (not destruction or uploads).
+        let mut allocated_bytes = 0u64;
+        let mut allocation_time = Duration::ZERO;
+        if fif.scene_index_buffer.len() < index_count {
+            fif.scene_index_buffer.take().destroy(allocator);
+            let start = Instant::now();
+            fif.scene_index_buffer = Buffer::<[GpuIndex]>::new(
+                allocator,
+                index_count,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+            allocation_time += start.elapsed();
+            allocated_bytes += fif.scene_index_buffer.size() as u64;
+            fif.world = World::default();
         }
-
-        let object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
-            &self.core.allocator,
-            new_world.objects.len() as u32,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-        let object_instance_buffers = std::array::from_fn(|_| {
-            Buffer::<[GpuObjectInstance]>::new(
-                &self.core.allocator,
-                new_world.objects.len() as u32,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        if fif.object_instance_buffer.len() < object_count {
+            fif.object_instance_buffer.take().destroy(allocator);
+            let start = Instant::now();
+            fif.object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
+                allocator,
+                object_count,
+                storage_usage,
                 vk_mem::MemoryUsage::AutoPreferDevice,
-            )
-        });
-
-        let indirect_cmd_buffers = std::array::from_fn(|_| {
-            Buffer::<GpuDrawCommandBuffer>::new_trailing(
-                &self.core.allocator,
-                maximum_scene_meshlets,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            );
+            allocation_time += start.elapsed();
+            allocated_bytes += fif.object_instance_buffer.size() as u64;
+            fif.world = World::default();
+        }
+        if fif.indirect_cmd_buffer.len() < meshlet_count {
+            fif.indirect_cmd_buffer.take().destroy(allocator);
+            let start = Instant::now();
+            fif.indirect_cmd_buffer = Buffer::<GpuDrawCommandBuffer>::new_trailing(
+                allocator,
+                meshlet_count,
+                storage_usage | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 vk_mem::MemoryUsage::AutoPreferDevice,
-            )
-        });
-
-        let frustum_passing_meshlet_buffers = std::array::from_fn(|_| {
-            Buffer::<GpuFrustumPassingMeshletBuffer>::new_trailing(
-                &self.core.allocator,
-                maximum_scene_meshlets,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+            );
+            allocation_time += start.elapsed();
+            allocated_bytes += fif.indirect_cmd_buffer.size() as u64;
+            fif.world = World::default();
+        }
+        if fif.frustum_passing_meshlet_buffer.len() < meshlet_count {
+            fif.frustum_passing_meshlet_buffer.take().destroy(allocator);
+            let start = Instant::now();
+            fif.frustum_passing_meshlet_buffer = Buffer::<GpuFrustumPassingMeshletBuffer>::new_trailing(
+                allocator,
+                meshlet_count,
+                storage_usage,
                 vk_mem::MemoryUsage::AutoPreferDevice,
-            )
-        });
-
-        let total_meshlet_buffer_count = new_world
-            .meshes
-            .iter()
-            .map(|mesh_id| self.gpu_meshes.get(mesh_id).unwrap().meshlet_buffer.len() as usize)
-            .sum::<usize>();
-        let total_index_count = scene_index_count as usize;
-        let total_triangle_count = total_index_count / 3;
-        let scene_index_copy_bytes = total_index_count * std::mem::size_of::<GpuIndex>();
-        let visibility_buffer_count = new_visibility_buffers.values().map(|queue| queue.len()).sum::<usize>();
-        let object_instance_bytes =
-            object_instance_buffer.size() + object_instance_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
-        let indirect_cmd_capacity = indirect_cmd_buffers[0].len() as usize;
-        let indirect_cmd_bytes = indirect_cmd_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
-        let frustum_passing_capacity = frustum_passing_meshlet_buffers[0].len() as usize;
-        let frustum_passing_bytes = frustum_passing_meshlet_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
-        let staging_bytes_used = staging.size() as usize;
-
-        let mesh_upload_bytes = |mesh_id: &MeshHandle| -> usize {
-            let gpu_mesh = self.gpu_meshes.get(mesh_id).unwrap();
-            gpu_mesh.meshlet_buffer.size() + gpu_mesh.index_buffer.size() + gpu_mesh.vertex_buffer.size()
-        };
-        let added_mesh_upload_bytes = added_meshes.iter().map(mesh_upload_bytes).sum::<usize>();
-
-        println!(
-            "Scene {} created ({} staged):\n  objects = {}\n  meshes = {} (+{}, -{}, {} new mesh payload)",
-            generation,
-            format_bytes(staging_bytes_used),
-            format_usize_commas(new_world.objects.len()),
-            format_usize_commas(new_world.meshes.len()),
-            format_usize_commas(added_meshes.len()),
-            format_usize_commas(removed_meshes.len()),
-            format_bytes(added_mesh_upload_bytes),
-        );
-
-        for mesh_id in &added_meshes {
-            let mesh = self.meshes.get(mesh_id).unwrap();
-            let meshlet_count = mesh.lods.iter().map(|lod| lod.len()).sum::<usize>();
-            let max_lod_meshlets = mesh.lods.iter().map(|lod| lod.len()).max().unwrap_or(0);
-            let gpu_mesh = self.gpu_meshes.get(mesh_id).unwrap();
+            );
+            allocation_time += start.elapsed();
+            allocated_bytes += fif.frustum_passing_meshlet_buffer.size() as u64;
+            fif.world = World::default();
+        }
+        if allocated_bytes != 0 {
             println!(
-                "    + {:?}: lods = {}, meshlets = {} ({}) max_lod_meshlets = {}, indices = {} ({}), vertices = {} ({}), upload = {}",
-                mesh_id,
-                mesh.lod_count,
-                format_usize_commas(meshlet_count),
-                format_bytes(gpu_mesh.meshlet_buffer.size()),
-                format_usize_commas(max_lod_meshlets),
-                format_usize_commas(gpu_mesh.index_buffer.len() as usize),
-                format_bytes(gpu_mesh.index_buffer.size()),
-                format_usize_commas(gpu_mesh.vertex_buffer.len() as usize),
-                format_bytes(gpu_mesh.vertex_buffer.size()),
-                format_bytes(mesh_upload_bytes(mesh_id)),
+                "FIF {frame_index} resized buffers: {:.2} MiB allocated in {:.3} ms (CPU)",
+                allocated_bytes as f64 / MiB as f64,
+                allocation_time.as_secs_f64() * 1000.0,
             );
         }
-        for mesh_id in &removed_meshes {
-            println!("    - {:?}", mesh_id);
+
+        // TODO: Use the resident world diff to plan incremental updates. Clearing
+        // the local world on growth will naturally request full repopulation.
+        // For now, rebuild the entire layout and let DataUpload copy every mesh.
+        fif.scene_index_offsets.clear();
+        let mut offset = 0;
+        for mesh_id in &world.meshes {
+            fif.scene_index_offsets.insert(*mesh_id, offset);
+            offset += self.gpu_meshes[mesh_id].index_buffer.len();
         }
-        println!(
-            "  meshlet buffers = {} meshlets\n  max visible meshlets = {}\n  scene indices = {} ({} triangles, {} GPU copy)\n  scene buffers = {} objects ({}), {} indirect commands ({}), {} frustum candidates ({})\n  visibility buffers = {} buffers ({})",
-            format_usize_commas(total_meshlet_buffer_count),
-            format_usize_commas(indirect_cmd_capacity),
-            format_usize_commas(total_index_count),
-            format_usize_commas(total_triangle_count),
-            format_bytes(scene_index_copy_bytes),
-            format_usize_commas(new_world.objects.len()),
-            format_bytes(object_instance_bytes),
-            format_usize_commas(indirect_cmd_capacity),
-            format_bytes(indirect_cmd_bytes),
-            format_usize_commas(frustum_passing_capacity),
-            format_bytes(frustum_passing_bytes),
-            format_usize_commas(visibility_buffer_count),
-            format_bytes(visibility_buffer_bytes),
-        );
 
-        self.core.device.end_command_buffer(cmd).unwrap();
-        self.core
-            .device
-            .queue_submit2(
-                *self.core.graphics_queue.lock().unwrap(),
-                &[vk::SubmitInfo2::default()
-                    .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(cmd)])
-                    .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(self.scene_timeline)
-                        .value(timeline_wait_value)
-                        .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)])
-                    .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(self.scene_timeline)
-                        .value(timeline_signal_value)
-                        .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
-                vk::Fence::null(),
-            )
-            .unwrap();
-
-        self.pending_scene_states.insert(
-            generation,
-            PendingSceneState {
-                cmd,
-                staging,
-                scene_states: SceneState {
-                    scene_object_instance_buffer: object_instance_buffer,
-                    object_instance_buffer: object_instance_buffers,
-                    indirect_cmd_buffers,
-                    scene_index_buffer,
-                    frustum_passing_meshlet_buffers,
-                    visibility_buffers: new_visibility_buffers,
-                    scene_index_offsets,
-                    world: new_world,
-                },
-            },
-        );
+        world
     }
 
     pub fn create_object(
@@ -2506,9 +2196,12 @@ impl Renderer {
         scale: f32,
         orientation: Quat,
     ) -> Option<ObjectHandle> {
-        self.scene_states_dirty = true;
+        if !self.meshes.contains_key(&mesh) {
+            return None;
+        }
         let handle = self.resource_counter.next().unwrap();
-        self.objects.insert(handle, Object { mesh, position, scale, orientation });
+        self.world.objects.insert(handle, Object { mesh, position, scale, orientation });
+        self.world.meshes.insert(mesh);
         Some(handle)
     }
 
